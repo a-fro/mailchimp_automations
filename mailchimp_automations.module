@@ -1,0 +1,361 @@
+<?php
+
+/**
+ * @file
+ * Module file for mailchimp_automations.
+ */
+
+/**
+ * Implements hook_entity_info().
+ */
+function mailchimp_automations_entity_info() {
+  $return = array(
+    'mailchimp_automation_entity' => array(
+      'label' => t('MailChimp Automation Entity'),
+      'plural label' => t('MailChimp Automation Entities'),
+      'controller class' => 'EntityAPIControllerExportable',
+      'entity class' => 'MailchimpAutomationEntity',
+      'base table' => 'mailchimp_automation_entity',
+      'uri callback' => 'entity_class_uri',
+      'fieldable' => FALSE,
+      'exportable' => TRUE,
+      'module' => 'mailchimp_automations',
+      'entity keys' => array(
+        'id' => 'mailchimp_automation_entity_id',
+        'name' => 'name',
+        'label' => 'label',
+      ),
+      // Enable the entity API's admin UI.
+      'admin ui' => array(
+        'path' => 'admin/config/services/mailchimp/automations',
+        'file' => 'includes/mailchimp_automations.admin.inc',
+        'controller class' => 'MailChimpAutomationUIController',
+      ),
+      'label callback' => 'mailchimp_automation_entity_info_label',
+      'access callback' => 'mailchimp_automations_entity_access',
+    ),
+  );
+
+  return $return;
+}
+
+/**
+ * Entity label callback.
+ */
+function mailchimp_automations_entity_info_label($entity, $entity_type) {
+  return empty($entity) ? 'New MailChimp Automation' : $entity->label;
+}
+
+/**
+ * Access callback for mailchimp_automation_entity.
+ */
+function mailchimp_automations_entity_access() {
+  return mailchimp_apikey_ready_access('administer mailchimp automations');
+}
+
+/**
+ * Implements hook_menu().
+ */
+function mailchimp_automations_menu() {
+  $items = array();
+  $mailchimp_automation_entities = mailchimp_automations_load_entities();
+  foreach ($mailchimp_automation_entities as $mailchimp_automation_entity) {
+    $arg = substr_count($mailchimp_automation_entity->entity_path, '/');
+    $items[$mailchimp_automation_entity->entity_path . '%entity_object/mailchimp_automation'] = array(
+      'title' => 'MailChimp Automation',
+      'load arguments' => array($mailchimp_automation_entity->entity_type),
+      'page callback' => 'mailchimp_automations_page',
+      'page arguments' => array($arg, $mailchimp_automation_entity),
+      'access callback' => 'mailchimp_automations_access',
+      'access arguments' => array($mailchimp_automation_entity),
+      'type' => MENU_LOCAL_TASK,
+    );
+  }
+
+  return $items;
+}
+
+/**
+ * Implements hook_entity_insert().
+ */
+function mailchimp_automations_entity_insert($entity, $type) {
+  $wrapper = entity_metadata_wrapper($type, $entity);
+  $bundle = $wrapper->getBundle();
+  if ($automation_entity = mailchimp_automations_entity_automation($type, $bundle)) {
+    mailchimp_automations_trigger_workflow($automation_entity, $wrapper);
+  }
+}
+
+/**
+ * Access callback for activity menu items.
+ */
+function mailchimp_automations_access(MailchimpAutomationEntity $mailchimp_automation_entity) {
+  if (user_access('access mailchimp automations')) {
+    return TRUE;
+  }
+  return FALSE;
+}
+
+/**
+ * Loads a single or multiple instances of MailchimpAutomationEntity.
+ *
+ * @param string $name
+ *   Optional name of the MailchimpAutomationEntity instance to load.
+ *
+ * @return mixed
+ *   Array of MailchimpAutomationEntity instances or one instance if $name is set.
+ */
+function mailchimp_automations_load_entities($id = NULL) {
+  $types = entity_load_multiple_by_name('mailchimp_automation_entity', isset($id) ? array($id) : FALSE);
+  return isset($id) ? reset($types) : $types;
+}
+
+/**
+ * Wrapper for MailchimpAutomations->getAutomations().
+ *
+ * @param string $workflow_id
+ *   The MailChimp workflow_id.
+ *
+ * @return array
+ *   The workflow automations for the active MailChimp API account.
+ */
+function mailchimp_automations_get_automations() {
+  $mc_auto = mailchimp_get_api_object('MailchimpAutomations');
+  $results = $mc_auto->getAutomations();
+  return $results->automations;
+}
+
+/**
+ * Wrapper for MailchimpAutomations->getWorkflow().
+ *
+ * @param string $workflow_id
+ *   The MailChimp workflow_id.
+ *
+ * @return array
+ *   The $key is workflow_id and the $value is the
+ */
+function mailchimp_automations_get_automation($workflow_id) {
+  $mc_auto = mailchimp_get_api_object('MailchimpAutomations');
+  $workflow = $mc_auto->getWorkflow($workflow_id);
+  $title = $worflow->settings->title;
+  if (!empty($title)) {
+    return array(
+      $workflow->id => $title,
+    );
+  }
+  return NULL;
+}
+
+/**
+ * Wrapper for MailchimpAutomations->getWorkflowEmails().
+ *
+ * @param string $workflow_id
+ *   The MailChimp workflow_id.
+ *
+ * @return array
+ *   An array of email workflows associated with this automation.
+ */
+function mailchimp_automations_get_emails_for_workflow($workflow_id) {
+  $emails = array();
+  $mc_auto = mailchimp_get_api_object('MailchimpAutomations');
+  $results = $mc_auto->getWorkflowEmails($workflow_id);
+  $email_results = $results->emails;
+  foreach ($email_results as $email) {
+    $title = $email->settings->title;
+    if (!empty($title)) {
+      $emails[$email->id] = $title;
+    }
+  }
+  return $emails;
+}
+
+/**
+ * Triggers a workflow automation via the MailChimp API.
+ *
+ * @param object $automation
+ *   The MailchimpAutomationEntity object from the database.
+ * @param EntityMetadataWrapper $wrapped_entity
+ *   The wrapped entity that triggered the workflow automation.
+ */
+function mailchimp_automations_trigger_workflow($automation_entity, $wrapped_entity) {
+  $email_property_field = $automation_entity->email_property;
+  $email = $wrapped_entity->$email_property_field->value();
+  if (!mailchimp_is_subscribed($automation_entity->list_id, $email)) {
+    $merge_vars = NULL;
+    drupal_alter('mailchimp_automations_mergevars', $merge_vars, $automation_entity, $wrapped_entity);
+    // Skip mailchimp_subscribe to avoid cron if set
+    $added = mailchimp_subscribe_process($automation_entity->list_id, $email, $merge_vars);
+    if (!$added) {
+      watchdog('mailchimp', 'An error occurred subscribing @email to list @list during a workflow @automation. The automation did not comlplete.', array(
+        '@automation' => $automation_entity->label,
+        '@email' => $email,
+      ), WATCHDOG_ERROR);
+    }
+  }
+  $mc_auto = mailchimp_get_api_object('MailchimpAutomations');
+  try {
+    $result = $mc_auto->addWorkflowEmailSubscriber($automation_entity->workflow_id, $automation_entity->workflow_email_id, $email);
+    if ($result) {
+      module_invoke_all('mailchimp_automations_workflow_email_triggered', $automation_entity, $email, $wrapped_entity);
+    }
+  }
+  catch (Exception $e) {
+    watchdog('mailchimp', 'An error occurred triggering a workflow automation. Workflow: @automation, Email: @email. The automation did not successfully complete. "%message"', array(
+      '@automation' => $automation_entity->label,
+      '@email' => $email,
+      '%message' => $e->getMessage(),
+    ), WATCHDOG_ERROR);
+  }
+}
+
+/**
+ * Queries to see if there is an existing automation entity
+ *
+ * @param string $type
+ *   The entity type name
+ * @param string $bundle
+ *   The Drupal bundle for the entity
+ *
+ * @return Object
+ *   The mailchimp_automation_entity
+ */
+function mailchimp_automations_entity_automation($type, $bundle) {
+  $query = new EntityFieldQuery();
+
+  $query->entityCondition('entity_type', 'mailchimp_automation_entity')
+    ->propertyCondition('entity_type', $type)
+    ->propertyCondition('bundle', $bundle)
+    ->propertyCondition('status', 1);
+
+  $result = $query->execute();
+  if ($result) {
+    $entity_array = entity_load('mailchimp_automation_entity', array_keys($result['mailchimp_automation_entity']));
+    return reset($entity_array);
+  }
+  return NULL;
+}
+
+/**
+ * Content for the mailchimp log tab on entity instance pages.
+ *
+ * @param object $entity
+ *   The entity this page is being generated for.
+ * @param MailchimpAutomationEntity $mailchimp_automation_entity
+ *   The MailchimpAutomationEntity instance for this page.
+ *
+ * @return array
+ *   Render array for the activity page.
+ */
+function mailchimp_automations_page($entity, MailchimpAutomationEntity $mailchimp_automation_entity) {
+  $entity_wrapper = entity_metadata_wrapper($mailchimp_automation_entity->entity_type, $entity);
+  $email_property = $mailchimp_automation_entity->email_property;
+  $email_property_array = explode(':', $email_property);
+  $parent = $entity_wrapper;
+  foreach ($email_property_array as $drupal_field) {
+    if ($parent instanceof EntityListWrapper) {
+      $child_wrapper = $parent->get(0)->{$drupal_field};
+    }
+    else {
+      $child_wrapper = $parent->{$drupal_field};
+    }
+    $parent = $child_wrapper;
+  }
+  $email = $parent->value();
+  // Validate email address.
+  if (!valid_email_address($email)) {
+    return array(
+      'error_notice' => array(
+        '#markup' => t('%email does not contain a valid email address. Unable to lookup MailChimp activity history without a valid email.',
+          array('%email' => $email_property)
+        ),
+      ),
+    );
+  }
+
+  $header = array(
+    t('Campaign'),
+    t('Action'),
+    t('Date & Time'),
+  );
+  $rows = array();
+  // Loop through all activities, creating rows for each:
+  $user_activity = mailchimp_automations_get_all_activity($email);
+
+  /* @var \Mailchimp\MailchimpCampaigns $mc_campaigns */
+  $mc_campaigns = mailchimp_get_api_object('MailchimpCampaigns');
+  $result = $mc_campaigns->getCampaigns();
+  $campaigns = ($result->total_items > 0) ? $result->campaigns : array();
+
+  $campaign_index = array();
+  foreach ($campaigns as $campaign) {
+    $campaign_index[$campaign->id] = $campaign;
+  }
+  if (!empty($user_activity)) {
+    foreach ($user_activity as $list_activity) {
+      $rows[] = array(
+        'no_striping' => TRUE,
+        'data' => array(
+          array(
+            'data' => '<strong>List: ' . $list_activity['list']->name . '</strong>',
+            'colspan' => count($header),
+            'style' => 'text-align:center',
+          ),
+        ),
+      );
+
+      if (!empty($list_activity['activity'])) {
+        foreach ($list_activity['activity'] as $activity) {
+          if (!empty($activity->campaign_id)) {
+            $title = array(
+              'data' => array(
+                '#type' => 'link',
+                '#title' => $campaign_index[$activity->campaign_id]->settings->title,
+                '#href' => $campaign_index[$activity->campaign_id]->archive_url,
+              ),
+            );
+          }
+          else {
+            $title = $activity->title;
+          }
+          $rows[] = array(
+            $title,
+            $activity->action,
+            $activity->timestamp,
+          );
+        }
+      }
+      else {
+        $rows[] = array(
+          'no_striping' => TRUE,
+          'data' => array(
+            array(
+              'data' => 'No activity yet.',
+              'colspan' => count($header),
+              'style' => 'text-align:center',
+            ),
+          ),
+        );
+      }
+    }
+  }
+
+  $display['mailchimp_automations'] = array(
+    '#theme' => 'table',
+    '#header' => $header,
+    '#rows' => $rows,
+  );
+  return $display;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function mailchimp_automations_permission() {
+  $return = array();
+
+  $return['administer mailchimp automations'] = array(
+    'title' => t('Administer MailChimp automation entities'),
+    'description' => t('Add, Delete, and Configure MailChimp Automation entity settings.'),
+  );
+  return $return;
+}
